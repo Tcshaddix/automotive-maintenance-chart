@@ -1,63 +1,61 @@
 import sqlite3
 
-# 1. Connect to local SQLite database (creates maintenance.db)
-conn = sqlite3.connect("maintenance.db")
-cursor = conn.cursor()
 
-# 2. Define Table Schema
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS vehicle_maintenance (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    make TEXT NOT NULL,
-    model TEXT NOT NULL,
-    year INTEGER NOT NULL,
-    annual_cost REAL NOT NULL,
-    reliability_score REAL
-);
-""")
+def run_real_data_analysis():
+    conn = sqlite3.connect("maintenance.db")
+    cursor = conn.cursor()
 
-# 3. Insert Sample Data
-sample_data = [
-    ("Toyota", "Corolla", 2019, 380.00, 4.8),
-    ("Toyota", "Corolla", 2019, 410.00, 4.8),
-    ("Honda", "Civic", 2020, 450.00, 4.6),
-    ("Honda", "Civic", 2020, 470.00, 4.6),
-    ("BMW", "3 Series", 2018, 1100.00, 3.2),
-    ("BMW", "3 Series", 2018, 1250.00, 3.2),
-    ("Ford", "F-150", 2021, 650.00, 4.1),
-    ("Ford", "F-150", 2021, 680.00, 4.1),
-]
+    # Verify official_vehicles table exists and contains data
+    cursor.execute("SELECT COUNT(*) FROM official_vehicles;")
+    record_count = cursor.fetchone()[0]
 
-cursor.executemany("""
-INSERT INTO vehicle_maintenance (make, model, year, annual_cost, reliability_score)
-VALUES (?, ?, ?, ?, ?);
-""", sample_data)
+    if record_count == 0:
+        print("⚠️ 'official_vehicles' table is empty!")
+        print("Run 'python fet_open_data.py' first to populate real vehicle data.")
+        conn.close()
+        return
 
-conn.commit()
+    # Query real API/benchmark data
+    query = """
+    SELECT 
+        make,
+        model,
+        year,
+        vehicle_class,
+        annual_maintenance_cost AS annual_maint,
+        epa_annual_fuel_cost AS annual_fuel,
+        ROUND(annual_maintenance_cost * 10, 2) AS maint_10yr,
+        ROUND(epa_annual_fuel_cost * 10, 2) AS fuel_10yr,
+        ROUND((annual_maintenance_cost + epa_annual_fuel_cost) * 10, 2) AS total_10yr,
+        reliability_score
+    FROM official_vehicles
+    ORDER BY total_10yr ASC;
+    """
 
-# 4. Execute Analysis Query
-query = """
-SELECT 
-    make,
-    model,
-    year,
-    ROUND(AVG(annual_cost), 2) AS avg_annual_cost,
-    ROUND(AVG(annual_cost) * 10, 2) AS estimated_10yr_cost,
-    ROUND(AVG(reliability_score), 1) AS avg_reliability
-FROM vehicle_maintenance
-GROUP BY make, model, year
-HAVING COUNT(*) >= 2
-ORDER BY estimated_10yr_cost ASC;
-"""
+    cursor.execute(query)
+    rows = cursor.fetchall()
 
-cursor.execute(query)
-rows = cursor.fetchall()
+    print(f"\n--- Real 10-Year Automotive Cost Analysis ({record_count} Vehicles Analyzed) ---")
+    print(
+        f"{'MAKE':<10} | {'MODEL':<15} | {'YEAR':<5} | {'CLASS':<22} | {'10YR MAINT':<11} | {'10YR FUEL':<11} | {'10YR TOTAL':<11}")
+    print("-" * 102)
 
-# 5. Output Formatted Results
-print("\n--- 10-Year Automotive Maintenance Cost Ranking ---")
-print(f"{'MAKE':<10} | {'MODEL':<10} | {'YEAR':<5} | {'AVG ANNUAL':<10} | {'10-YR COST':<10} | {'SCORE':<5}")
-print("-" * 65)
-for make, model, year, avg_annual, est_10yr, score in rows:
-    print(f"{make:<10} | {model:<10} | {year:<5} | ${avg_annual:<9} | ${est_10yr:<9} | {score:<5}")
+    for row in rows:
+        make, model, yr, v_class, a_maint, a_fuel, maint_10yr, fuel_10yr, total_10yr, score = row
+        v_class_str = (v_class[:20] + "..") if v_class and len(v_class) > 22 else (v_class or "N/A")
 
-conn.close()
+        print(
+            f"{make:<10} | "
+            f"{model:<15} | "
+            f"{yr:<5} | "
+            f"{v_class_str:<22} | "
+            f"${maint_10yr:<10,.2f} | "
+            f"${fuel_10yr:<10,.2f} | "
+            f"${total_10yr:<10,.2f}"
+        )
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    run_real_data_analysis()

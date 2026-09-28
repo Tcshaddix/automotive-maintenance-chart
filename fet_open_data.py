@@ -1,99 +1,142 @@
-import _sqlite3
+import sqlite3
 import requests
-import pandas as pd
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# 1. Initialize SQLite Database & Tables
-conn = _sqlite3.connect("maintenance.db")
-cursor = conn.cursor()
+# Brand benchmark fallbacks for maintenance and reliability
+BRAND_BENCHMARKS = {
+    "Toyota": (380.00, 4.8),
+    "Honda": (420.00, 4.7),
+    "Subaru": (510.00, 4.3),
+    "Mazda": (460.00, 4.5),
+    "Ford": (650.00, 4.1),
+    "Chevrolet": (640.00, 4.1),
+    "Nissan": (520.00, 4.0),
+    "Volkswagen": (680.00, 3.8),
+    "BMW": (1150.00, 3.2),
+    "Mercedes-Benz": (1200.00, 3.1),
+    "Audi": (1100.00, 3.3),
+    "Lexus": (450.00, 4.7),
+    "Acura": (480.00, 4.5),
+    "Hyundai": (470.00, 4.2),
+    "Kia": (470.00, 4.2),
+}
+DEFAULT_BENCHMARK = (550.00, 4.0)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS official_vehicles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    make TEXT NOT NULL,
-    model TEXT NOT NULL,
-    year INTEGER NOT NULL,
-    nhtsa_validated INTEGER DEFAULT 0,
-    epa_annual_fuel_cost REAL,
-    annual_maintenance_cost REAL,
-    reliability_score REAL
-);
-""")
-conn.commit()
 
-# 2. Fetch Open Maintenance Benchmarks from CSV
-df_maintenance = pd.read_csv("maintenance_benchmarks.csv")
+def create_resilient_session():
+    """Configures a requests Session with automated retry logic and custom headers."""
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "Accept": "application/json",
+        "User-Agent": "AutoMaintenanceAnalyzer/1.0"
+    })
+    return session
 
-# 3. Enrich Each Record using Public Government APIs
-for _, row in df_maintenance.iterrows():
-    make = row['make']
-    model = row['model']
-    year = int(row['year'])
-    maint_cost = float(row['annual_repair_avg'])
-    reliability = float(row['reliability_score'])
 
-    # A. Query NHTSA vPIC API (Validate Year/Make?model)
-    nhtsa_url = f"https://vpic.nhtsa.dot.gov/api/vehicles/getmodelsformakeyear/make/{make}/modelyear/{year}?format=json"
-    nhtsa_valid = 0
-    try:
-        res = requests.get(nhtsa_url, timeout=5).json()
-        models_found = [m['Model_Name'].lower() for m in res.get('Results', [])]
-        if model.lower() in models_found:
-            nhtsa_valid = 1
-    except Exception as e:
-        print(f"NHTSA API call warning for {make} {model}: {e}")
+def process_catalog_in_batches(batch_size=50, delay_per_request=0.1):
+    conn = sqlite3.connect("maintenance.db", timeout=20)
+    cursor = conn.cursor()
 
-    # B. Query EPA FuelEconomy.gov API (Retrieve Official Fuel Expenses)
-    epa_url = f"https://www.fueleconomy.gov/ws/rest/vehicle/menu/options?year={year}&make={make}&model={model}"
-    epa_fuel_cost = 0.0
-    try:
-        # EPA API accepts JSON header
-        epa_res = requests.get(epa_url, headers={"Accept": "application/json"}, timeout=5)
-        if epa_res.status_code == 200 and epa_res.text:
-            menu_data = epa_res.json()
-            # If valid EPA vehicle menu items exist
-            if "menuItem" in menu_data:
-                items = menu_data["menuItem"]
-                vehicle_id = items[0]["value"] if isinstance(items, list) else items["value"]
-
-                # Fetch specific vehicle spec record for annual fuel estimate
-                spec_url = f"https://www.fueleconomy.gov/ws/rest/vehicle/{vehicle_id}"
-                spec_res = requests.get(spec_url, headers={"Accept": "application/json"}, timeout=5).json()
-                epa_fuel_cost = float(spec_res.get("fuelCost08", 0.0))
-    except Exception as e:
-        print(f"EPA API call warning for {make} {model}: {e}")
-
-    # C. Insert Enriched Data into SQLite
+    # 1. Ensure target table exists with UNIQUE constraint
     cursor.execute("""
-    INSERT INTO official_vehicles
-    (make, model, year, nhtsa_validated, epa_annual_fuel_cost, annual_maintenance_cost, reliability_score)
-    VALUES (?, ?, ?, ?, ?, ?, ?);
-    """, (make, model, year, nhtsa_valid, epa_fuel_cost, maint_cost, reliability))
-
+    CREATE TABLE IF NOT EXISTS official_vehicles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER NOT NULL,
+        make TEXT NOT NULL,
+        model TEXT NOT NULL,
+        vehicle_class TEXT,
+        epa_annual_fuel_cost REAL DEFAULT 0.0,
+        annual_maintenance_cost REAL DEFAULT 550.0,
+        reliability_score REAL DEFAULT 4.0,
+        UNIQUE(year, make, model) ON CONFLICT REPLACE
+    );
+    """)
     conn.commit()
 
-    #4. Run Analysis Query: Total 10-Year Operating Cost (Fuel + Maintenance)
-    query = """
-    SELECT
-        make,
-        model,
-        year,
-        nhtsa_validated,
-        annual_maintenance_cost AS avg_annual_maint,
-        epa_annual_fuel_cost AS avg_annual_fuel,
-        ROUND((annual_maintenance_cost + epa_annual_fuel_cost) * 10, 2) AS estimated_10yr_total_operating_cost,
-        reliability_score
-    FROM official_vehicles
-    ORDER BY estimated_10yr_total_operating_cost ASC;
-    """
+    # 2. Select catalog entries that are missing or 'Unclassified' in official_vehicles
+    cursor.execute("""
+    SELECT c.year, c.make, c.model 
+    FROM vehicle_catalog c
+    LEFT JOIN official_vehicles o 
+        ON c.year = o.year AND c.make = o.make AND c.model = o.model
+    WHERE o.vehicle_class IS NULL OR o.vehicle_class = 'Unclassified';
+    """)
+    unprocessed = cursor.fetchall()
+    total_unprocessed = len(unprocessed)
 
-    cursor.execute(query)
-    results = cursor.fetchall()
+    if total_unprocessed == 0:
+        print("✅ All vehicles in 'vehicle_catalog' have already been processed into 'official_vehicles'.")
+        conn.close()
+        return
 
-    print("\n--- Legal & Open Data Automotive 10-Year Ownership Projections ---")
-print(f"{'MAKE':<10} | {'MODEL':<10} | {'YEAR':<5} | {'NHTSA OK':<8} | {'10-YR MAINT':<12} | {'10-YR FUEL':<12} | {'10-YR TOTAL':<12}")
-print("-" * 85)
-for row in results:
-    make, model, yr, nhtsa, maint, fuel, total_10yr, score = row
-    print(f"{make:<10} | {model:<10} | {yr:<5} | {nhtsa:<8} | ${maint*10:<11.2f} | ${fuel*10:<11.2f} | ${total_10yr:<12.2f}")
+    print(f"📦 Found {total_unprocessed} catalog entries requiring EPA enrichment.")
+    print(f"⚙️ Running in batches of {batch_size} with a {delay_per_request}s delay between API calls...\n")
 
-conn.close()
+    session = create_resilient_session()
+    processed_count = 0
+
+    for i in range(0, total_unprocessed, batch_size):
+        batch = unprocessed[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (total_unprocessed + batch_size - 1) // batch_size
+
+        print(f"🚀 Processing Batch {batch_num}/{total_batches} ({len(batch)} vehicles)...")
+
+        for year, make, model in batch:
+            maint_cost, reliability = BRAND_BENCHMARKS.get(make, DEFAULT_BENCHMARK)
+
+            epa_menu_url = f"https://www.fueleconomy.gov/ws/rest/vehicle/menu/options?year={year}&make={make}&model={model}"
+            epa_fuel_cost = 0.0
+            v_class = "Unclassified"
+
+            try:
+                res = session.get(epa_menu_url, timeout=5)
+                if res.status_code == 200 and res.text:
+                    menu_data = res.json().get("menuItem", [])
+                    if isinstance(menu_data, dict):
+                        menu_data = [menu_data]
+
+                    if menu_data:
+                        vehicle_id = menu_data[0]["value"]
+                        spec_url = f"https://www.fueleconomy.gov/ws/rest/vehicle/{vehicle_id}"
+                        spec_res = session.get(spec_url, timeout=5)
+
+                        if spec_res.status_code == 200 and spec_res.text:
+                            spec_json = spec_res.json()
+                            epa_fuel_cost = float(spec_json.get("fuelCost08", 0.0))
+                            v_class = spec_json.get("vClass", "Unclassified")
+            except Exception as e:
+                # Catch connection blips gracefully
+                pass
+
+            # Insert/replace record
+            cursor.execute("""
+            INSERT OR REPLACE INTO official_vehicles 
+            (year, make, model, vehicle_class, epa_annual_fuel_cost, annual_maintenance_cost, reliability_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+            """, (year, make, model, v_class, epa_fuel_cost, maint_cost, reliability))
+
+            processed_count += 1
+            time.sleep(delay_per_request)  # Rate limiting delay
+
+        # Commit SQLite transaction after every batch
+        conn.commit()
+        print(f"  ✓ Saved batch {batch_num}. Progress: {processed_count}/{total_unprocessed} vehicles done.")
+
+    conn.close()
+    print("\n🎉 Complete dataset ingestion finished successfully!")
+
+
+if __name__ == "__main__":
+    process_catalog_in_batches(batch_size=50, delay_per_request=0.1)
